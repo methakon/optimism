@@ -142,6 +142,32 @@ impl<EngineClient_: EngineClient> SealTask<EngineClient_> {
         Ok(payload_envelope)
     }
 
+    /// Rebuilds the current derived attributes as deposits-only after a deterministic failure.
+    async fn recover_with_deposits_only(&self, state: &mut EngineState) -> SealTaskError {
+        if self.attributes.is_deposits_only() {
+            return SealTaskError::DepositOnlyPayloadFailed;
+        }
+
+        warn!(target: "engine", "Re-attempting payload import with deposits only.");
+        let deposits_only_attrs = self.attributes.as_deposits_only();
+        match build_and_seal(
+            state,
+            self.engine.clone(),
+            self.cfg.clone(),
+            deposits_only_attrs,
+            self.is_attributes_derived,
+            self.block_sink.clone(),
+        )
+        .await
+        {
+            Ok(_) => {
+                info!(target: "engine", "Successfully imported deposits-only payload");
+                SealTaskError::HoloceneInvalidFlush
+            }
+            Err(_) => SealTaskError::DepositOnlyPayloadReattemptFailed,
+        }
+    }
+
     /// Inserts a payload into the engine with Holocene fallback support.
     ///
     /// This function handles:
@@ -177,28 +203,8 @@ impl<EngineClient_: EngineClient> SealTask<EngineClient_> {
                     self.attributes.attributes().payload_attributes.timestamp,
                 ) =>
             {
-                warn!(target: "engine", error = ?e, "Re-attempting payload import with deposits only.");
-
-                // HOLOCENE: Re-attempt payload import with deposits only
-                // First build the deposits-only payload, then seal it
-                let deposits_only_attrs = self.attributes.as_deposits_only();
-
-                return match build_and_seal(
-                    state,
-                    self.engine.clone(),
-                    self.cfg.clone(),
-                    deposits_only_attrs.clone(),
-                    self.is_attributes_derived,
-                    self.block_sink.clone(),
-                )
-                .await
-                {
-                    Ok(_) => {
-                        info!(target: "engine", "Successfully imported deposits-only payload");
-                        Err(SealTaskError::HoloceneInvalidFlush)
-                    }
-                    Err(_) => Err(SealTaskError::DepositOnlyPayloadReattemptFailed),
-                };
+                warn!(target: "engine", error = ?e, "Derived payload import failed");
+                return Err(self.recover_with_deposits_only(state).await);
             }
             Err(e) => {
                 error!(target: "engine", "Payload import failed: {e}");
@@ -225,9 +231,22 @@ impl<EngineClient_: EngineClient> SealTask<EngineClient_> {
     ) -> Result<OpExecutionPayloadEnvelope, SealTaskError> {
         // Fetch the payload just inserted from the EL and import it into the engine.
         let block_import_start_time = Instant::now();
-        let new_payload = self
+        let new_payload = match self
             .seal_payload(&self.cfg, &self.engine, self.payload_id, self.attributes.clone())
-            .await?;
+            .await
+        {
+            Ok(payload) => payload,
+            Err(SealTaskError::GetPayloadFailed(error))
+                if self.is_attributes_derived &&
+                    self.cfg.is_holocene_active(
+                        self.attributes.attributes().payload_attributes.timestamp,
+                    ) =>
+            {
+                warn!(target: "engine", %error, "Derived payload build failed");
+                return Err(self.recover_with_deposits_only(state).await);
+            }
+            Err(error) => return Err(error),
+        };
 
         // Insert the payload into the engine and reuse its decoded block information.
         let new_block_ref = self.insert_payload(state, new_payload.clone()).await?;

@@ -60,6 +60,21 @@ fn deposit_with_encoded() -> WithEncoded<OpTransactionSigned> {
     WithEncoded::new(encoded, tx)
 }
 
+fn regular_with_encoded(nonce: u64) -> WithEncoded<OpTransactionSigned> {
+    let tx: OpTransactionSigned = TxEip1559 {
+        chain_id: 10,
+        nonce,
+        gas_limit: MIN_TRANSACTION_GAS,
+        max_fee_per_gas: 1,
+        to: TxKind::Call(Address::with_last_byte(1)),
+        ..Default::default()
+    }
+    .into_signed(Signature::test_signature())
+    .into();
+    let encoded = Bytes::from(tx.encoded_2718());
+    WithEncoded::new(encoded, tx)
+}
+
 /// Builds a payload-builder ctx on an SDM-active (Interop/Lagoon at genesis) chain.
 ///
 /// `no_tx_pool` picks local sequencing (`false`) vs rebuilding a derived block (`true`); `opt_in`
@@ -391,6 +406,25 @@ fn block_builder_with_mode_honors_snapshot_over_live_opt_in() {
         format!("{err:?}").contains("SDM not active"),
         "expected the disabled-mode post-exec rejection, got: {err:?}",
     );
+}
+
+/// Derived payload attributes are an exact transaction list. An EVM-invalid transaction must fail
+/// the build instead of being silently omitted from the block returned to the consensus layer.
+#[test]
+fn sdm_h3_derived_build_rejects_invalid_sequencer_transaction() {
+    let mut ctx = interop_ctx(true, false, None);
+    ctx.config.attributes.transactions =
+        vec![deposit_with_encoded(), regular_with_encoded(5), regular_with_encoded(0)];
+
+    let state_provider = StateProviderTest::default();
+    let mut db = State::builder()
+        .with_database(StateProviderDatabase::new(&state_provider))
+        .with_bundle_update()
+        .build();
+    let mut builder = ctx.block_builder(&mut db).expect("block builder can be created");
+
+    ctx.execute_sequencer_transactions(&mut builder, None)
+        .expect_err("no_tx_pool builds must reject, not skip, an invalid sequencer transaction");
 }
 
 #[test]

@@ -45,6 +45,7 @@ func (ev PayloadSealExpiredErrorEvent) String() string {
 type BuildSealEvent struct {
 	Info         eth.PayloadInfo
 	BuildStarted time.Time
+	Parent       eth.L2BlockRef
 	// if payload should be promoted to safe (must also be pending safe, see DerivedFrom)
 	Concluding bool
 	// payload is promoted to pending-safe if non-zero
@@ -67,8 +68,19 @@ var ErrSealInvalid = errors.New("sealed payload is invalid")
 func (e *EngineController) onBuildSeal(ctx context.Context, ev BuildSealEvent) {
 	result, err := e.sealBuild(ev.Info, ev.BuildStarted)
 	if err != nil {
-		// Translate seal errors into events for the event-driven (derivation)
-		// path; the direct-call path receives them as return values instead.
+		// A derived build executes a fixed transaction list. Once Holocene is active, any failure
+		// to retrieve that build must take the deterministic deposits-only recovery path instead
+		// of retrying the same attributes forever. Sequencer builds use the direct-call path and
+		// do not reach this event handler.
+		if errors.Is(err, ErrSealExpired) &&
+			ev.DerivedFrom != (eth.L1BlockRef{}) &&
+			e.rollupCfg.IsHolocene(ev.DerivedFrom.Time) {
+			e.emitDepositsOnlyPayloadAttributesRequest(ctx, ev.Parent.ID(), ev.DerivedFrom)
+			return
+		}
+
+		// Translate other seal errors into events for the event-driven (derivation) path; the
+		// direct-call path receives them as return values instead.
 		if errors.Is(err, ErrSealExpired) {
 			e.emitter.Emit(ctx, PayloadSealExpiredErrorEvent{
 				Info:        ev.Info,

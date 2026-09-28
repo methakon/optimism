@@ -108,6 +108,41 @@ func (e *sealingEngine) GetPayload(context.Context, eth.PayloadInfo) (*eth.Execu
 	return e.envelope, nil
 }
 
+type failedSealingEngine struct {
+	testutils.MockEngine
+}
+
+func (e *failedSealingEngine) GetPayload(context.Context, eth.PayloadInfo) (*eth.ExecutionPayloadEnvelope, error) {
+	return nil, eth.InputError{Inner: errors.New("payload build failed"), Code: eth.UnknownPayload}
+}
+
+// A failed derived build is deterministic for the supplied attributes. Retrying the same build
+// forever stalls the safe chain, so post-Holocene derivation must replace it with deposits only.
+func TestSDMH1DerivedGetPayloadFailureRequestsDepositsOnly(t *testing.T) {
+	activation := uint64(0)
+	cfg := &rollup.Config{HoloceneTime: &activation}
+	parent := eth.L2BlockRef{Hash: common.Hash{0x11}, Number: 10, Time: 20}
+	derivedFrom := eth.L1BlockRef{Hash: common.Hash{0x22}, Number: 5, Time: 20}
+
+	var emitted []event.Event
+	emitter := event.EmitterFunc(func(_ context.Context, ev event.Event) {
+		emitted = append(emitted, ev)
+	})
+	ec := NewEngineController(context.Background(), &failedSealingEngine{}, testlog.Logger(t, 0), metrics.NoopMetrics, cfg, &sync.Config{}, &testutils.MockL1Source{}, emitter, nil)
+	ec.OnEvent(context.Background(), BuildSealEvent{
+		Info:         eth.PayloadInfo{ID: eth.PayloadID{0x01}},
+		BuildStarted: time.Now(),
+		Parent:       parent,
+		DerivedFrom:  derivedFrom,
+	})
+
+	require.Len(t, emitted, 1)
+	require.Equal(t, derive.DepositsOnlyPayloadAttributesRequestEvent{
+		Parent:      parent.ID(),
+		DerivedFrom: derivedFrom,
+	}, emitted[0])
+}
+
 func (e *sealingEngine) NewPayload(context.Context, *eth.ExecutionPayload, *common.Hash) (*eth.PayloadStatusV1, error) {
 	e.newPayloads++
 	return &eth.PayloadStatusV1{Status: eth.ExecutionValid}, nil

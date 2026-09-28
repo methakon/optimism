@@ -30,6 +30,7 @@ func (e *EngineController) onBuildStarted(ctx context.Context, ev BuildStartedEv
 		e.emitter.Emit(ctx, BuildSealEvent{
 			Info:         ev.Info,
 			BuildStarted: ev.BuildStarted,
+			Parent:       ev.Parent,
 			Concluding:   ev.Concluding,
 			DerivedFrom:  ev.DerivedFrom,
 		})

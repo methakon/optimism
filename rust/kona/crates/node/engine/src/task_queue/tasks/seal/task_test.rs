@@ -5,6 +5,7 @@ use crate::{
         TestAttributesBuilder, TestEngineStateBuilder, test_block_info, test_engine_client_builder,
     },
 };
+use alloy_primitives::Bytes;
 use alloy_rpc_types_engine::PayloadId;
 use kona_genesis::RollupConfig;
 use rstest::rstest;
@@ -68,4 +69,33 @@ async fn unsafe_head_check_variants(
     } else {
         assert_eq!(classify(&result.expect_err("seal should fail against the mock")), expected);
     }
+}
+
+#[tokio::test]
+async fn sdm_h1_derived_get_payload_failure_attempts_deposits_only_recovery() {
+    let parent = test_block_info(10);
+    let attributes = TestAttributesBuilder::new()
+        .with_parent(parent)
+        .with_transactions(vec![Bytes::from_static(&[1])])
+        .build();
+    let mut state = TestEngineStateBuilder::new().with_unsafe_head(parent).build();
+    let mut cfg = RollupConfig::default();
+    cfg.hardforks.holocene_time = Some(0);
+
+    let task = SealTask::new(
+        Arc::new(test_engine_client_builder().build()),
+        Arc::new(cfg),
+        PayloadId::new([1u8; 8]),
+        attributes,
+        true,
+        Atomic,
+        None,
+        Arc::new(crate::NoopBlockSink),
+    );
+
+    let err = task.execute(&mut state).await.expect_err("unconfigured mock must fail recovery");
+    assert!(
+        matches!(err, SealTaskError::DepositOnlyPayloadReattemptFailed),
+        "derived getPayload failure must enter deposits-only recovery, got {err:?}"
+    );
 }

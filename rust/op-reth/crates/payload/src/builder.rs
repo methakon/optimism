@@ -1008,11 +1008,15 @@ where
 
             let gas_used = match builder.execute_transaction(sequencer_tx.clone()) {
                 Ok(gas_used) => gas_used,
-                Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
-                    error,
-                    ..
-                })) => {
-                    trace!(target: "payload_builder", %error, ?sequencer_tx, "Error in sequencer transaction, skipping.");
+                Err(
+                    err @ BlockExecutionError::Validation(BlockValidationError::InvalidTx {
+                        ..
+                    }),
+                ) => {
+                    if self.force_empty() {
+                        return Err(PayloadBuilderError::EvmExecutionError(Box::new(err)));
+                    }
+                    trace!(target: "payload_builder", %err, ?sequencer_tx, "Error in sequencer transaction, skipping.");
                     continue;
                 }
                 Err(err) => {
