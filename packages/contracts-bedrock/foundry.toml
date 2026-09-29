@@ -123,7 +123,8 @@ depth = 32
 [profile.cicoverage]
 optimizer = false
 compilation_restrictions = []
-# Keep coverage concurrency within the runner's memory budget.
+# Coverage is memory-bound; the CI runner was upsized for RAM, so cap workers at the
+# previous CPU count instead of scaling to the new one.
 threads = 16
 
 [profile.cicoverage.fuzz]
