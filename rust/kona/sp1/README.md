@@ -208,6 +208,13 @@ proposer loses the ability to defend, resolve, and claim those games.
   prestate and remove its games from the owned set). The registered prestate's
   keys are verified BEFORE any game is created on it, so the proposer never
   bonds a game it has not proven it can defend.
+  The proposer also reads the verifier behind each `SP1PlonkAdapter` it is about to rely on
+  (`sp1Verifier().VERIFIER_HASH()`) and compares it with `sha256(sp1_verifier::PLONK_VK_BYTES)`,
+  the selector the linked sp1-sdk puts on every proof. The registered adapter is checked
+  every creation cycle, so a mismatched registration pauses creation; each game's own
+  immutable verifier is checked before a proof is requested, so a game on another circuit is
+  given up without proving spend. The ERROR log names both hashes and the SDK circuit; the fix
+  is a verifier re-pin or an SDK change. Defense of games on a compatible verifier continues.
 - `KONA_SP1_PROPOSER_PROOF_PROVIDER=mock`: dev-only. Runs the full pipeline natively (witness
   collection computes the real range/consolidation outputs and the aggregation
   inputs are validated), then submits placeholder proof bytes. Only a deployment
@@ -272,11 +279,14 @@ Names below use the `kona_sp1_proposer_` prefix.
 |---|---|---|
 | `up` | Gauge | `1` after the process starts. This does not imply chain-dependent startup validation has completed. Use Prometheus scrape availability to detect process loss. |
 | `signer_balance_eth` | Gauge | L1 transaction signer's balance in ETH. |
+| `signer_nonce` / `signer_pending_nonce` | Gauge | L1 signer's latest mined and pending nonces. Pending stays above latest while proposer transactions wait in the mempool; a gap that does not close means a stuck transaction. |
 | `prove_balance` | Gauge | Configured SP1 network account's spendable balance in PROVE, not the signer's ERC-20 wallet balance. Absent in mock mode. |
 | `deadline_passed_total` | Counter | Missed game windows observed by this process, with `window="defense"` or `window="fast_finality"`. Defense expiry and missed fast-finality acceleration have different consequences. |
 | `defense_deadline_remaining_seconds` | Gauge | Minimum observed defense deadline minus L1 block time, including queued and active games. Zero is the deadline boundary; negative values indicate expiry. |
+| `proof_requests` | Gauge | SPN requests of games still being proven, by `kind` (`range`, `consolidation`, `aggregation`) and `state` (`submitting`, `submitted`, `fulfilled`, `terminal`). A game's requests drop out once its proof is submitted or its progress is discarded. `terminal` requests wait for a retry signal. |
+| `spn_requester_info` | Gauge | `1`, with the SPN requester address in the `address` label. Absent in mock mode. |
 
-Balances refresh every 15 seconds. Failed balance reads return `NaN`
+Balances and nonces refresh every 15 seconds. Failed reads return `NaN`
 without blocking other metrics. Deadline metrics update during game sync
 using the confirmed L1 timestamp.
 
@@ -303,13 +313,22 @@ including the L1 transaction path. Use the task-stats log to investigate stuck w
 
 All proposer-owned variables use the `KONA_SP1_PROPOSER_` prefix.
 
+For a standard network, set `--network <name>` or `KONA_SP1_PROPOSER_NETWORK`
+to a predefined network name recognized by OP Stack services, such as `op-mainnet` or
+`op-sepolia`. The command-line
+value overrides the environment value. Custom deployments can set
+`KONA_SP1_PROPOSER_FACTORY_ADDRESS`; an explicit address overrides network lookup. Startup fails
+when neither source is set, the network name is unknown, or the selected registry chain has no
+`DisputeGameFactory` address.
+
 Required core configuration:
 
 | Variable | Purpose |
 |---|---|
-| `KONA_SP1_PROPOSER_L1_RPC` | L1 execution RPC |
+| `KONA_SP1_PROPOSER_L1_RPC` | L1 execution RPC; must support standard JSON-RPC batch requests (current proposer game-state batches contain at most 4 `eth_call` entries) |
 | `KONA_SP1_PROPOSER_SUPERROOT_RPCS` | op-supernode or single-chain op-node RPCs serving `superroot_atTimestamp`. Multiple comma-separated RPCs can be provided for redundancy |
-| `KONA_SP1_PROPOSER_FACTORY_ADDRESS` | `DisputeGameFactory` address |
+| `KONA_SP1_PROPOSER_NETWORK` | Predefined network name recognized by OP Stack services, such as `op-mainnet`; alternative to `KONA_SP1_PROPOSER_FACTORY_ADDRESS` |
+| `KONA_SP1_PROPOSER_FACTORY_ADDRESS` | Explicit `DisputeGameFactory` address; required when no network is selected and overrides network lookup |
 | `KONA_SP1_PROPOSER_PRESTATES_URL` | prestate artifact directory (`<vkey>.agg.bin.gz` + `<vkey>.range.bin.gz`) |
 | `KONA_SP1_PROPOSER_PROOF_PROVIDER` | `network` or `mock`; no default |
 | `KONA_SP1_PROPOSER_L1_BEACON_RPC` | L1 beacon API (blob sidecars for derivation witnesses) |
@@ -327,6 +346,7 @@ Optional core and operational configuration:
 | `KONA_SP1_PROPOSER_FETCH_INTERVAL` | loop interval in seconds (default `30`) |
 | `KONA_SP1_PROPOSER_METRICS_PORT` | `0` disables metrics; `auto` selects a free port (default `0`) |
 | `KONA_SP1_PROPOSER_SYNC_L1_CONFIRMATIONS` | L1 confirmation lag for pinned reads (default `0`) |
+| `KONA_SP1_PROPOSER_MAX_GAME_DEADLINE_LAG_SECONDS` | Startup discovery and pending-game eviction cutoff relative to the anchor deadline (default `1209600`, 14 days) |
 | `KONA_SP1_PROPOSER_TX_CONFIRMATION_TIMEOUT` | transaction confirmation timeout in seconds (default `180`) |
 | `KONA_SP1_PROPOSER_MAX_FEE_PER_GAS` | L1 max-fee cap in wei (default uncapped) |
 | `KONA_SP1_PROPOSER_MAX_PRIORITY_FEE_PER_GAS` | L1 priority-fee cap in wei (default uncapped) |
@@ -341,9 +361,13 @@ SP1 network configuration applies when `KONA_SP1_PROPOSER_PROOF_PROVIDER=network
 
 | Variable | Purpose |
 |---|---|
-| `KONA_SP1_PROPOSER_NETWORK_PRIVATE_KEY` | SPN requester private key, or AWS KMS key ARN when KMS is enabled |
+| `KONA_SP1_PROPOSER_NETWORK_PRIVATE_KEY` | local SPN requester private key; mutually exclusive with `KONA_SP1_PROPOSER_SPN_SIGNER_URL` |
 | `KONA_SP1_PROPOSER_NETWORK_RPC_URL` | SPN RPC override; absent or empty uses the SP1 SDK default for the selected network mode |
-| `KONA_SP1_PROPOSER_USE_KMS_REQUESTER` | use AWS KMS for request signing (default `false`) |
+| `KONA_SP1_PROPOSER_SPN_SIGNER_URL` | HTTPS op-signer endpoint for remote SPN request signing; mutually exclusive with `KONA_SP1_PROPOSER_NETWORK_PRIVATE_KEY` |
+| `KONA_SP1_PROPOSER_SPN_SIGNER_ADDRESS` | authorized op-signer address for SPN request signing |
+| `KONA_SP1_PROPOSER_SPN_SIGNER_TLS_CA` | server CA certificate path for the SPN op-signer connection |
+| `KONA_SP1_PROPOSER_SPN_SIGNER_TLS_CERT` | client certificate path for the SPN op-signer connection |
+| `KONA_SP1_PROPOSER_SPN_SIGNER_TLS_KEY` | client private-key path for the SPN op-signer connection |
 | `KONA_SP1_PROPOSER_RANGE_PROOF_STRATEGY` | range fulfillment strategy (default `auction`) |
 | `KONA_SP1_PROPOSER_AGG_PROOF_STRATEGY` | aggregation fulfillment strategy (default `auction`) |
 | `KONA_SP1_PROPOSER_SP1_TIMEOUT_SECONDS` | per-proof request deadline and client wait (default `7200`) |
@@ -379,13 +403,16 @@ increase witness collection, fixed proving overhead, SPN request count, and
 aggregation input size. `RANGE_GAS_LIMIT` limits each range request, not the
 total work of the defense.
 
-Transaction signing requires one of these configurations:
+Transaction signing requires exactly one of these configurations:
 
 | Variable | Purpose |
 |---|---|
-| `KONA_SP1_PROPOSER_PRIVATE_KEY` | local L1 transaction-signing key |
-| `KONA_SP1_PROPOSER_SIGNER_URL` | Web3Signer URL; requires `KONA_SP1_PROPOSER_SIGNER_ADDRESS` |
+| `KONA_SP1_PROPOSER_PRIVATE_KEY` | local L1 transaction-signing key; mutually exclusive with `KONA_SP1_PROPOSER_SIGNER_URL` |
+| `KONA_SP1_PROPOSER_SIGNER_URL` | Web3Signer URL; requires `KONA_SP1_PROPOSER_SIGNER_ADDRESS`; mutually exclusive with `KONA_SP1_PROPOSER_PRIVATE_KEY` |
 | `KONA_SP1_PROPOSER_SIGNER_ADDRESS` | Web3Signer address; requires `KONA_SP1_PROPOSER_SIGNER_URL` |
+| `KONA_SP1_PROPOSER_SIGNER_TLS_CA` | server CA PEM path; all three signer TLS paths are required together and enable mTLS to op-signer |
+| `KONA_SP1_PROPOSER_SIGNER_TLS_CERT` | client certificate PEM path; all three signer TLS paths are required together and enable mTLS to op-signer |
+| `KONA_SP1_PROPOSER_SIGNER_TLS_KEY` | client private-key PEM path; all three signer TLS paths are required together and enable mTLS to op-signer |
 
 Logging and telemetry:
 
@@ -397,7 +424,7 @@ Logging and telemetry:
 | `KONA_SP1_PROPOSER_LOG_FORMAT` | `pretty` or `json` (default `pretty`) |
 
 The proposer and its dependencies also observe the standard `RUST_LOG`, `NO_COLOR`,
-`SSL_CERT_DIR`, `SSL_CERT_FILE`, `OTEL_*`, proxy, AWS credential, and SP1 worker/debug
+`SSL_CERT_DIR`, `SSL_CERT_FILE`, `OTEL_*`, proxy, and SP1 worker/debug
 variables. `KONA_SP1_ELF_DIR` configures shared build/test infrastructure.
 
 ### Fast finality

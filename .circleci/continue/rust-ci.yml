@@ -4,7 +4,7 @@ version: 2.1
 # This file contains all Rust CI commands, parameterized jobs, crate-specific jobs, and workflows.
 
 orbs:
-  utils: ethereum-optimism/circleci-utils@1.0.31
+  utils: ethereum-optimism/circleci-utils@1.0.32
   gcp-cli: circleci/gcp-cli@3.0.1
 
 parameters:
@@ -792,6 +792,7 @@ workflows:
       - rust-ci-fmt:
           name: rust-fmt
           directory: rust
+          command: "just fmt-check && just check-upstream-mirrors"
           context: &rust-ci-context
             - circleci-repo-readonly-authenticated-github-token
             # GCP Workload Identity coords + reader SA + bucket for the sccache
